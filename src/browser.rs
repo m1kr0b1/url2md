@@ -82,38 +82,39 @@ impl BrowserController {
         }
 
         if self.verbose {
-            eprintln!("[html2md] Browser: Page loading, waiting for content...");
+            eprintln!("[html2md] Browser: Waiting for page to load...");
         }
 
-        // Wait for page to stabilize - critical for X.com
-        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-        
-        // Wait for specific content indicators
-        let mut attempts = 0;
-        let max_attempts = (timeout_secs / 2) as usize;
-        
-        while attempts < max_attempts {
-            attempts += 1;
-            
-            // Try to get page title to verify content loaded
-            match tab.get_title() {
-                Ok(title) if !title.is_empty() => {
-                    if self.verbose {
-                        eprintln!("[html2md] Browser: Page loaded, title: {}", title);
-                    }
-                    break;
+        // Poll document.readyState every 100ms instead of sleeping blindly
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            let ready = tab.evaluate("document.readyState", false)
+                .ok()
+                .and_then(|v| v.value)
+                .and_then(|v| v.as_str().map(|s| s == "complete" || s == "interactive"))
+                .unwrap_or(false);
+
+            if ready {
+                if self.verbose {
+                    eprintln!("[html2md] Browser: DOM ready ({:?})", start.elapsed());
                 }
-                _ => {
-                    if self.verbose {
-                        eprintln!("[html2md] Browser: Waiting for content... (attempt {})", attempts);
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                }
+                break;
             }
+
+            if std::time::Instant::now() >= deadline {
+                if self.verbose {
+                    eprintln!("[html2md] Browser: Timed out waiting for DOM");
+                }
+                break;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
-        // Additional wait for JS to finish rendering
-        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        // Short extra wait only if caller asked for it (default is now 0)
+        if wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        }
 
         if self.verbose {
             eprintln!("[html2md] Browser: Extracting HTML...");

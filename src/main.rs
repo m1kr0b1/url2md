@@ -45,52 +45,44 @@ async fn run(args: Args) -> Result<(), Error> {
     // Validate URL
     let url = validate_url(&args.url)?;
 
-    // Determine if we need JS rendering
-    let use_js_rendering = !args.no_js;
+    // Always try HTTP first — fast path for static pages
+    if args.verbose {
+        eprintln!("[html2md] Fetching via HTTP...");
+    }
 
-    let (final_url, final_html) = if use_js_rendering {
-        // Go straight to browser - skip HTTP fetch for JS-heavy sites like X.com
+    let scraper = Scraper::with_user_agent(
+        args.timeout_duration(),
+        args.verbose,
+        args.user_agent(),
+    )?;
+
+    let fetch_result = scraper.fetch(&url).await?;
+
+    let (final_url, final_html) = if !args.no_js && should_use_js(&fetch_result.body, args.min_content_tokens) {
+        // HTTP content is thin or JS-heavy — fall back to Chrome
         if args.verbose {
-            eprintln!("[html2md] Using headless browser for JavaScript rendering...");
+            eprintln!("[html2md] Content looks JS-rendered, switching to headless browser...");
         }
 
         match render_with_browser(&url, args.js_wait_ms, args.timeout, args.verbose).await {
             Ok(render_result) => {
                 if args.verbose {
-                    eprintln!("[html2md] JavaScript rendering successful!");
+                    eprintln!("[html2md] Browser rendering successful!");
                 }
                 (render_result.url, render_result.html)
             }
             Err(e) => {
-                // Fallback to HTTP if browser fails
                 if args.verbose {
-                    eprintln!("[html2md] Browser failed: {}", e);
-                    eprintln!("[html2md] Falling back to HTTP fetch...");
+                    eprintln!("[html2md] Browser failed ({}), using HTTP result", e);
                 }
-                
-                let scraper = Scraper::with_user_agent(
-                    args.timeout_duration(),
-                    args.verbose,
-                    args.user_agent(),
-                )?;
-                
-                let fetch_result = scraper.fetch(&url).await?;
                 (fetch_result.url, fetch_result.body)
             }
         }
     } else {
-        // HTTP only mode
+        // HTTP content is good — use it directly
         if args.verbose {
-            eprintln!("[html2md] Fetching via HTTP (no JS)...");
+            eprintln!("[html2md] Using HTTP result ({} bytes)", fetch_result.body.len());
         }
-        
-        let scraper = Scraper::with_user_agent(
-            args.timeout_duration(),
-            args.verbose,
-            args.user_agent(),
-        )?;
-        
-        let fetch_result = scraper.fetch(&url).await?;
         (fetch_result.url, fetch_result.body)
     };
 
@@ -137,42 +129,22 @@ fn validate_url(url: &str) -> Result<String, Error> {
 
 /// Determine if JS rendering should be used based on content
 fn should_use_js(html: &str, min_tokens: usize) -> bool {
-    // Count rough tokens (words + visible elements)
+    // Large responses have real server-rendered content — no need for Chrome
+    if html.len() > 50_000 {
+        return false;
+    }
+
+    let has_thin_content = html.len() < min_tokens * 4;
+
+    // Only check for SPA/JS markers on small responses
     let content = html.to_lowercase();
-    
-    // Check for indicators of JavaScript-rendered content
-    let js_indicators = [
-        "ng-app",
-        "ng-controller",
-        "ng-init",
-        "react",
-        "vue",
-        "angular",
-        "ember",
-        "backbone",
-        "svelte",
-        "data-v-",      // Vue
-        "ember-cli-",   // Ember
-    ];
+    let has_spa_markers = content.contains("data-reactroot")
+        || content.contains("ng-app=")
+        || content.contains("ember-cli-")
+        || (content.contains("id=\"root\"") && content.contains("<script"))
+        || (content.contains("id=\"app\"") && content.contains("<script"));
 
-    let has_js_indicators = js_indicators.iter().any(|ind| content.contains(ind));
-    
-    // Check for SPA indicators
-    let spa_indicators = [
-        "id=\"app\"",
-        "id=\"root\"",
-        "class=\"app\"",
-        "class=\"root\"",
-        "data-reactroot",
-    ];
-
-    let has_spa_indicators = spa_indicators.iter().any(|ind| content.contains(ind));
-
-    // Check for thin content
-    let has_thin_content = html.len() < min_tokens * 4; // Rough estimate: 4 chars per token
-
-    // Use JS if content is thin or has JS indicators
-    has_thin_content || has_js_indicators || has_spa_indicators
+    has_thin_content || has_spa_markers
 }
 
 /// Render page with headless browser

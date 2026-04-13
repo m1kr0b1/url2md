@@ -42,8 +42,8 @@ pub struct Args {
     #[arg(long, default_value = "500")]
     pub min_content_tokens: usize,
 
-    /// Additional delay before JS rendering wait (milliseconds)
-    #[arg(long, default_value = "3000")]
+    /// Extra wait after JS page load (milliseconds); increase for slow SPAs
+    #[arg(long, default_value = "0")]
     pub js_wait_ms: u64,
 }
 

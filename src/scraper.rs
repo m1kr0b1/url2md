@@ -9,7 +9,6 @@ use reqwest::{
     Client, ClientBuilder,
 };
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
 
 /// HTTP scraper with browser-like behavior
 pub struct Scraper {
@@ -70,19 +69,12 @@ impl Scraper {
     pub async fn fetch(&self, url: &str) -> Result<FetchResult> {
         let start = Instant::now();
 
-        // Add realistic delay before request (human-like)
-        sleep(Duration::from_millis(100 + rand_delay())).await;
-
         if self.verbose {
             eprintln!("[html2md] Fetching: {}", url);
         }
 
         let response = self.client.get(url).send().await?;
         let elapsed = start.elapsed();
-
-        // Add delay after response (simulate reading)
-        sleep(Duration::from_millis(50 + rand_delay())).await;
-
         let status = response.status();
         let final_url = response.url().to_string();
 
@@ -134,16 +126,6 @@ pub struct FetchResult {
     pub content_type: Option<String>,
     pub status: reqwest::StatusCode,
     pub elapsed: Duration,
-}
-
-/// Generate a random delay for human-like behavior (0-200ms)
-fn rand_delay() -> u64 {
-    use std::time::SystemTime;
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
-    (seed % 200) as u64
 }
 
 #[cfg(test)]
