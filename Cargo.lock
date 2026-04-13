@@ -748,6 +748,7 @@ dependencies = [
  "regex",
  "reqwest",
  "scraper",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "url",

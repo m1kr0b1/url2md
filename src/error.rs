@@ -62,6 +62,9 @@ pub enum Error {
 
     #[error("{0}")]
     Custom(String),
+
+    #[error("Parse error: {0}")]
+    ParseError(String),
 }
 
 impl From<reqwest::Error> for Error {

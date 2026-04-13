@@ -45,6 +45,17 @@ async fn run(args: Args) -> Result<(), Error> {
     // Validate URL
     let url = validate_url(&args.url)?;
 
+    // X.com / Twitter: use oEmbed API — Chrome is always blocked there
+    if is_twitter_url(&url) {
+        if args.verbose {
+            eprintln!("[html2md] Detected X/Twitter URL, using oEmbed API...");
+        }
+        let scraper = Scraper::with_user_agent(args.timeout_duration(), args.verbose, args.user_agent())?;
+        let markdown = fetch_tweet_oembed(&scraper, &url, args.verbose).await?;
+        write_output(&markdown, &args.output)?;
+        return Ok(());
+    }
+
     // Always try HTTP first — fast path for static pages
     if args.verbose {
         eprintln!("[html2md] Fetching via HTTP...");
@@ -125,6 +136,57 @@ fn validate_url(url: &str) -> Result<String, Error> {
     }
 
     Ok(url)
+}
+
+/// Extract clean tweet text from oEmbed blockquote HTML
+fn extract_tweet_text(html: &str) -> String {
+    use ::scraper::{Html, Selector};
+    let doc = Html::parse_fragment(html);
+    // The first <p> inside the blockquote contains the tweet text
+    if let Ok(sel) = Selector::parse("blockquote p") {
+        let parts: Vec<String> = doc.select(&sel)
+            .take(1) // only first <p> — second is the author/date line
+            .map(|el| -> String { el.text().collect::<Vec<_>>().join("") })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !parts.is_empty() {
+            return parts.join("\n\n");
+        }
+    }
+    html.to_string()
+}
+
+/// Check if a URL is an X.com or Twitter URL
+fn is_twitter_url(url: &str) -> bool {
+    url.contains("://x.com/") || url.contains("://twitter.com/")
+}
+
+/// Fetch a tweet via the public oEmbed API and return Markdown
+async fn fetch_tweet_oembed(scraper: &Scraper, url: &str, verbose: bool) -> Result<String, Error> {
+    let oembed_url = format!(
+        "https://publish.twitter.com/oembed?url={}&omit_script=true",
+        url::form_urlencoded::byte_serialize(url.as_bytes()).collect::<String>()
+    );
+
+    if verbose {
+        eprintln!("[html2md] oEmbed URL: {}", oembed_url);
+    }
+
+    let result = scraper.fetch(&oembed_url).await?;
+
+    // Parse the JSON response
+    let json: serde_json::Value = serde_json::from_str(&result.body)
+        .map_err(|e| Error::ParseError(format!("oEmbed JSON parse error: {}", e)))?;
+
+    let author = json["author_name"].as_str().unwrap_or("Unknown");
+    let author_url = json["author_url"].as_str().unwrap_or("");
+    let html = json["html"].as_str().unwrap_or("");
+
+    // oEmbed returns a <blockquote> with the tweet text — extract just the <p> content
+    let tweet_text = extract_tweet_text(html);
+
+    Ok(format!("**[{}]({})** on X.com\n\n{}\n\n> Source: {}", author, author_url, tweet_text.trim(), url))
 }
 
 /// Determine if JS rendering should be used based on content
