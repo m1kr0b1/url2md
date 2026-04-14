@@ -45,15 +45,12 @@ async fn run(args: Args) -> Result<(), Error> {
     // Validate URL
     let mut url = validate_url(&args.url)?;
 
-    // Reddit: redirect to old.reddit.com which is plain server-rendered HTML
+    // Reddit blocks all programmatic access (TLS/HTTP2 fingerprinting via Cloudflare).
+    // Requires their official OAuth API — not currently supported.
     if is_reddit_url(&url) {
-        let old_url = url
-            .replace("://reddit.com/", "://old.reddit.com/")
-            .replace("://www.reddit.com/", "://old.reddit.com/");
-        if args.verbose {
-            eprintln!("[html2md] Detected Reddit URL, redirecting to {}", old_url);
-        }
-        url = old_url;
+        eprintln!("Reddit is not supported: their Cloudflare bot protection blocks all automated access.");
+        eprintln!("Use Reddit's official API (https://www.reddit.com/prefs/apps) for programmatic access.");
+        std::process::exit(1);
     }
 
     // X.com / Twitter: use oEmbed API — Chrome is always blocked there
