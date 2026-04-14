@@ -35,6 +35,8 @@ impl Converter {
         let root = self.select_one(&document, "article.markdown-body")
             .or_else(|| self.select_one(&document, "#readme"))
             .or_else(|| self.select_one(&document, ".markdown-body"))
+            .or_else(|| self.select_one(&document, "#mw-content-text"))   // Wikipedia
+            .or_else(|| self.select_one(&document, ".mw-parser-output"))  // Wikipedia
             .or_else(|| self.select_one(&document, "article"))
             .or_else(|| self.select_one(&document, "#main-content"))
             .or_else(|| self.select_one(&document, "#content"))
@@ -93,6 +95,10 @@ impl Converter {
             "[class*='notification']", "[class*='modal']", "[class*='overlay']",
             "[class*='popup']", "[class*='toast']", "[class*='skip']",
             "[role='navigation']", "[role='banner']", "[role='contentinfo']",
+            // Wikipedia-specific
+            ".mw-editsection", ".mw-jump-link", ".catlinks", ".navbox",
+            ".reflist", ".refbegin", "#toc", ".toc", ".infobox",
+            ".sidebar", ".hatnote", ".mw-references-wrap",
         ];
         for sel_str in &nav_classes {
             if let Ok(sel) = Selector::parse(sel_str) {
@@ -125,7 +131,7 @@ impl Converter {
         match tag {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level = tag[1..].parse().unwrap_or(1);
-                let text = self.get_text(element).trim().to_string();
+                let text = self.get_heading_text(element).trim().to_string();
                 if !text.is_empty() {
                     items.push(format!("{} {}", "#".repeat(level), text));
                 }
@@ -162,16 +168,43 @@ impl Converter {
                 }
             }
             "table" => {
-                // Extract rows directly — avoid triple-counting via tbody/tr/td recursion
-                if let Ok(tr_sel) = Selector::parse("tr") {
-                    for row in element.select(&tr_sel) {
-                        let cells: Vec<String> = row.child_elements()
-                            .filter(|e| matches!(e.value().name(), "td" | "th"))
-                            .map(|e| self.get_text(&e).trim().to_string())
+                // Collect direct rows only (through tbody/thead/tfoot but not nested tables)
+                let mut rows: Vec<scraper::ElementRef> = Vec::new();
+                for child in element.child_elements() {
+                    match child.value().name() {
+                        "tbody" | "thead" | "tfoot" => {
+                            for row in child.child_elements() {
+                                if row.value().name() == "tr" {
+                                    rows.push(row);
+                                }
+                            }
+                        }
+                        "tr" => rows.push(child),
+                        _ => {}
+                    }
+                }
+                for row in rows {
+                    let cells: Vec<scraper::ElementRef> = row.child_elements()
+                        .filter(|e| matches!(e.value().name(), "td" | "th"))
+                        .collect();
+
+                    // If any cell contains a nested table, this is a layout table — recurse into it
+                    let is_layout = cells.iter().any(|cell| {
+                        cell.child_elements().any(|c| c.value().name() == "table"
+                            || matches!(c.value().name(), "div" | "section" | "article" | "main"))
+                    });
+
+                    if is_layout {
+                        for cell in cells {
+                            self.extract_recursive(&cell, items);
+                        }
+                    } else {
+                        let texts: Vec<String> = cells.iter()
+                            .map(|e| self.get_text_no_tables(e).trim().to_string())
                             .filter(|t| !t.is_empty())
                             .collect();
-                        if !cells.is_empty() {
-                            items.push(cells.join(" | "));
+                        if !texts.is_empty() {
+                            items.push(texts.join(" | "));
                         }
                     }
                 }
@@ -200,8 +233,8 @@ impl Converter {
             "hr" => {
                 items.push("---".to_string());
             }
-            "div" | "section" | "article" | "main" | "span" | "body"
-            | "tbody" | "thead" | "tfoot" | "tr" => {
+            // Table structure elements — always recurse, never extract as text
+            "tbody" | "thead" | "tfoot" | "tr" => {
                 for child in element.child_elements() {
                     self.extract_recursive(&child, items);
                 }
@@ -210,13 +243,15 @@ impl Converter {
                 // If element contains block-level children, recurse rather than
                 // flattening all descendant text into one blob (e.g. custom elements
                 // like <markdown-accessiblity-table> that wrap tables/headings).
-                let has_block_children = element.child_elements().any(|e| {
-                    matches!(e.value().name(),
-                        "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-                        | "ul" | "ol" | "table" | "pre" | "blockquote"
-                        | "div" | "section" | "article" | "main"
-                    )
-                });
+                // Recurse if ANY child is not a purely inline element.
+                // Whitelist inline elements; everything else (div, center, table, etc.) triggers recursion.
+                let is_inline = |name: &str| matches!(name,
+                    "a" | "span" | "strong" | "b" | "em" | "i" | "code" | "small"
+                    | "sup" | "sub" | "abbr" | "cite" | "time" | "mark" | "kbd"
+                    | "br" | "img" | "button" | "label" | "input" | "select" | "wbr"
+                );
+                let has_block_children = element.child_elements()
+                    .any(|e| !is_inline(e.value().name()));
                 if has_block_children {
                     for child in element.child_elements() {
                         self.extract_recursive(&child, items);
@@ -231,76 +266,119 @@ impl Converter {
         }
     }
 
-    /// Get text from element, handling nested formatting
-    fn get_text(&self, element: &scraper::ElementRef) -> String {
-        let mut result = String::new();
-        let mut last_was_text = false;
-
+    /// Like get_text but skips nested table elements (used for table cell extraction)
+    fn get_text_no_tables(&self, element: &scraper::ElementRef) -> String {
+        let mut parts = Vec::new();
         for node in element.descendants() {
             if let Some(elem) = scraper::ElementRef::wrap(node.clone()) {
-                let tag = elem.value().name();
-                
-                match tag {
-                    "script" | "style" | "noscript" | "iframe" | "svg" | "canvas" => continue,
-                    "br" => {
-                        result.push(' ');
-                        last_was_text = false;
+                match elem.value().name() {
+                    "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" => continue,
+                    "script" | "style" | "noscript" => continue,
+                    _ => {}
+                }
+            } else if let Some(text) = node.value().as_text() {
+                // Skip if any ancestor is a nested table
+                let in_nested_table = node.ancestors().skip(1).any(|a| {
+                    a.value().as_element()
+                        .map(|e| matches!(e.name(), "table" | "tbody" | "thead" | "tr" | "td" | "th"))
+                        .unwrap_or(false)
+                        && a.id() != element.id()
+                });
+                if !in_nested_table {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        parts.push(t.to_string());
                     }
-                    "a" => {
-                        let text = elem.text().collect::<String>().trim().to_string();
-                        if !text.is_empty() {
-                            if last_was_text {
-                                result.push(' ');
-                            }
-                            result.push_str(&text);
-                            last_was_text = true;
-                        }
+                }
+            }
+        }
+        let text = parts.join(" ");
+        let re = Regex::new(r"\s+").unwrap();
+        // Strip citation refs
+        let text = Regex::new(r"\[\s*(?:note\s+)?[\w\d]+\s*\]|\[\s*\]")
+            .map(|re| re.replace_all(&text, "").to_string())
+            .unwrap_or(text);
+        re.replace_all(text.trim(), " ").to_string()
+    }
+
+    /// Get heading text, stripping [edit] links and similar noise
+    fn get_heading_text(&self, element: &scraper::ElementRef) -> String {
+        // Collect text from all non-edit children
+        let mut parts = Vec::new();
+        for node in element.descendants() {
+            if let Some(text_node) = node.value().as_text() {
+                let t = text_node.trim();
+                if !t.is_empty() && t != "edit" && t != "[edit]" {
+                    parts.push(t.to_string());
+                }
+            } else if let Some(elem) = scraper::ElementRef::wrap(node) {
+                // Skip <a> tags that are edit links
+                if elem.value().name() == "a" {
+                    let href = elem.value().attr("href").unwrap_or("");
+                    let text = elem.text().collect::<String>();
+                    if href.contains("action=edit") || text.trim() == "edit" {
+                        continue;
                     }
+                }
+            }
+        }
+        // Deduplicate consecutive identical words (heading text can be doubled in some parsers)
+        let text = parts.join(" ");
+        let re = Regex::new(r"\s+").unwrap();
+        re.replace_all(text.trim(), " ").to_string()
+    }
+
+    /// Get text from element — proper child-by-child traversal to avoid double-counting.
+    /// Parent elements and their text children are both visited by `descendants()`, so
+    /// using it causes text inside <a>/<strong>/etc to appear twice.
+    fn get_text(&self, element: &scraper::ElementRef) -> String {
+        let mut result = String::new();
+        self.collect_text(element, &mut result);
+        // Normalize whitespace
+        let re = Regex::new(r"\s+").unwrap();
+        let result = re.replace_all(result.trim(), " ").to_string();
+        // Strip citation refs: [1], [16], [note 4], [ ]
+        Regex::new(r"\[\s*(?:note\s+)?[\w\d]+\s*\]|\[\s*\]")
+            .map(|re| re.replace_all(&result, "").to_string())
+            .unwrap_or(result)
+    }
+
+    /// Recursive helper — iterates direct children only, then recurses.
+    fn collect_text(&self, element: &scraper::ElementRef, out: &mut String) {
+        for node in element.children() {
+            if let Some(text) = node.value().as_text() {
+                out.push_str(text);
+            } else if let Some(elem) = scraper::ElementRef::wrap(node) {
+                match elem.value().name() {
+                    "script" | "style" | "noscript" | "iframe" | "svg" | "canvas" => {}
+                    "br" => out.push(' '),
                     "strong" | "b" => {
-                        let text = elem.text().collect::<String>().trim().to_string();
-                        if !text.is_empty() {
-                            result.push_str(&format!("**{}**", text));
-                            last_was_text = true;
-                        }
+                        let mut inner = String::new();
+                        self.collect_text(&elem, &mut inner);
+                        let inner = inner.trim().to_string();
+                        if !inner.is_empty() { out.push_str(&format!("**{}**", inner)); }
                     }
                     "em" | "i" => {
-                        let text = elem.text().collect::<String>().trim().to_string();
-                        if !text.is_empty() {
-                            result.push_str(&format!("*{}*", text));
-                            last_was_text = true;
-                        }
+                        let mut inner = String::new();
+                        self.collect_text(&elem, &mut inner);
+                        let inner = inner.trim().to_string();
+                        if !inner.is_empty() { out.push_str(&format!("*{}*", inner)); }
                     }
                     "code" => {
-                        // Check if parent is pre
                         let is_pre = elem.parent()
                             .and_then(|p| p.value().as_element())
                             .map(|e| e.name() == "pre")
                             .unwrap_or(false);
                         if !is_pre {
-                            let text = elem.text().collect::<String>().trim().to_string();
-                            if !text.is_empty() {
-                                result.push_str(&format!("`{}`", text));
-                                last_was_text = true;
-                            }
+                            let text: String = elem.text().collect();
+                            let text = text.trim().to_string();
+                            if !text.is_empty() { out.push_str(&format!("`{}`", text)); }
                         }
                     }
-                    _ => {
-                        let text = elem.text().collect::<String>();
-                        if !text.trim().is_empty() {
-                            if last_was_text && !result.ends_with(' ') && !result.ends_with('\n') {
-                                result.push(' ');
-                            }
-                            result.push_str(&text);
-                            last_was_text = true;
-                        }
-                    }
+                    _ => self.collect_text(&elem, out),
                 }
             }
         }
-
-        // Normalize whitespace
-        let re = Regex::new(r"\s+").unwrap();
-        re.replace_all(&result, " ").to_string()
     }
 
     fn get_lang(&self, element: &scraper::ElementRef) -> String {
@@ -374,7 +452,8 @@ impl Converter {
                lower.contains("cookie use") || lower.contains("ads info") ||
                lower.contains("create account") || lower.contains("upgrade to premium") ||
                lower.contains("new to x") || lower.contains("skip to content") ||
-               lower.contains("you must be signed in") {
+               lower.contains("you must be signed in") ||
+               lower.contains("action=edit") || lower == "edit" || lower == "[edit]" {
                 continue;
             }
 
@@ -415,6 +494,17 @@ impl Converter {
             return true;
         }
 
+        // Word overlap: if 80%+ of the shorter string's words appear in the longer, it's a dupe
+        let a_words: std::collections::HashSet<&str> = a.split_whitespace().collect();
+        let b_words: std::collections::HashSet<&str> = b.split_whitespace().collect();
+        let min_words = a_words.len().min(b_words.len());
+        if min_words >= 5 {
+            let overlap = a_words.intersection(&b_words).count();
+            if overlap as f64 / min_words as f64 >= 0.8 {
+                return true;
+            }
+        }
+
         // Check for repeated content pattern (e.g., "texttexttext" vs "text")
         let a_base: String = a.chars().filter(|c| !c.is_whitespace()).collect();
         let b_base: String = b.chars().filter(|c| !c.is_whitespace()).collect();
@@ -428,7 +518,6 @@ impl Converter {
     /// Format output with proper spacing
     fn format_output(&self, lines: &[String]) -> String {
         let mut result = String::new();
-        let mut last_was_heading = false;
         let mut last_was_code = false;
 
         for line in lines {
@@ -439,23 +528,19 @@ impl Converter {
 
             let is_heading = trimmed.starts_with('#');
             let is_code = trimmed.starts_with("```");
-            let is_blockquote = trimmed.starts_with('>');
             let is_list = trimmed.starts_with('-');
 
-            // Add spacing before certain elements
             if !result.is_empty() {
-                if is_heading || (last_was_code && !is_code) {
+                if is_heading || is_code || last_was_code {
                     result.push_str("\n\n");
-                } else if is_list && !result.ends_with('\n') && !result.ends_with("\n\n") {
+                } else if is_list {
                     result.push('\n');
-                } else if !result.ends_with(' ') && !result.ends_with('\n') {
-                    result.push(' ');
+                } else {
+                    result.push_str("\n\n");
                 }
             }
 
             result.push_str(trimmed);
-
-            last_was_heading = is_heading;
             last_was_code = is_code;
         }
 

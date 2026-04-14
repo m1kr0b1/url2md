@@ -43,7 +43,18 @@ async fn run(args: Args) -> Result<(), Error> {
     }
 
     // Validate URL
-    let url = validate_url(&args.url)?;
+    let mut url = validate_url(&args.url)?;
+
+    // Reddit: redirect to old.reddit.com which is plain server-rendered HTML
+    if is_reddit_url(&url) {
+        let old_url = url
+            .replace("://reddit.com/", "://old.reddit.com/")
+            .replace("://www.reddit.com/", "://old.reddit.com/");
+        if args.verbose {
+            eprintln!("[html2md] Detected Reddit URL, redirecting to {}", old_url);
+        }
+        url = old_url;
+    }
 
     // X.com / Twitter: use oEmbed API — Chrome is always blocked there
     if is_twitter_url(&url) {
@@ -104,10 +115,14 @@ async fn run(args: Args) -> Result<(), Error> {
     };
 
     // Output result
+    let elapsed = start.elapsed();
     if args.verbose {
-        let elapsed = start.elapsed();
         eprintln!("[html2md] Conversion complete in {:?}", elapsed);
         eprintln!("[html2md] Output size: {} bytes", markdown.len());
+    }
+
+    if markdown.len() < 100 {
+        eprintln!("Warning: very little content extracted ({} bytes) — page may be paywalled, bot-blocked, or require authentication", markdown.len());
     }
 
     write_output(&markdown, &args.output)?;
@@ -157,6 +172,10 @@ fn extract_tweet_text(html: &str) -> String {
     html.to_string()
 }
 
+fn is_reddit_url(url: &str) -> bool {
+    url.contains("://reddit.com/") || url.contains("://www.reddit.com/")
+}
+
 /// Check if a URL is an X.com or Twitter URL
 fn is_twitter_url(url: &str) -> bool {
     url.contains("://x.com/") || url.contains("://twitter.com/")
@@ -191,22 +210,40 @@ async fn fetch_tweet_oembed(scraper: &Scraper, url: &str, verbose: bool) -> Resu
 
 /// Determine if JS rendering should be used based on content
 fn should_use_js(html: &str, min_tokens: usize) -> bool {
-    // Large responses have real server-rendered content — no need for Chrome
-    if html.len() > 50_000 {
-        return false;
+    // Check visible text density — JS-rendered pages have lots of HTML but little visible text
+    let visible_chars = {
+        let mut in_tag = false;
+        let mut count = 0usize;
+        for c in html.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                c if !in_tag && !c.is_whitespace() => count += 1,
+                _ => {}
+            }
+        }
+        count
+    };
+
+    let density = visible_chars as f64 / html.len().max(1) as f64;
+
+    // Low text density = JS-rendered shell (Medium, Reddit, SPAs)
+    if density < 0.08 {
+        return true;
     }
 
-    let has_thin_content = html.len() < min_tokens * 4;
+    // Thin content overall
+    if html.len() < min_tokens * 4 {
+        return true;
+    }
 
-    // Only check for SPA/JS markers on small responses
+    // Strong SPA markers
     let content = html.to_lowercase();
-    let has_spa_markers = content.contains("data-reactroot")
+    content.contains("data-reactroot")
         || content.contains("ng-app=")
         || content.contains("ember-cli-")
         || (content.contains("id=\"root\"") && content.contains("<script"))
-        || (content.contains("id=\"app\"") && content.contains("<script"));
-
-    has_thin_content || has_spa_markers
+        || (content.contains("id=\"app\"") && content.contains("<script"))
 }
 
 /// Render page with headless browser
